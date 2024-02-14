@@ -176,7 +176,7 @@ if __name__ == '__main__':
     os.makedirs('vis', exist_ok=True)
     os.makedirs(os.path.join('vis', args['task'], args['vit']), exist_ok=True)
     sam_args = {
-        'sam_checkpoint': "/home/tal/MedicalSam/cp/sam_" + args['vit'] + ".pth",
+        'sam_checkpoint': "cp/sam_" + args['vit'] + ".pth",
         'model_type': args['vit'],
         'generator_args': {
             'points_per_side': 8,

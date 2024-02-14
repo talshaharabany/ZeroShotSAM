@@ -95,7 +95,7 @@ class ImageLoader(torch.utils.data.Dataset):
 
 
 def get_glas_dataset(args, sam_trans, aug=True, is_finetune=False, loop=10):
-    datadir = '/home/tal/Medical/Warwick/'
+    datadir = 'Warwick/'
     transform_train, transform_test = get_glas_transform()
     if aug:
         ds_train = ImageLoader(datadir, train=True, is_finetune=is_finetune, transform=transform_train, sam_trans=sam_trans, loop=loop)
