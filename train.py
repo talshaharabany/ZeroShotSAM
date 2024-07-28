@@ -11,6 +11,20 @@ from segment_anything.utils.transforms import ResizeLongestSide
 import torch.nn.functional as F
 from utils import *
 
+def get_sam_model_output(sam, batched_input):
+    input_images = torch.stack([sam.preprocess(x["image"]) for x in batched_input], dim=0)
+    image_embeddings = sam.image_encoder(input_images)
+    sparse_embeddings, dense_embeddings = sam.prompt_encoder(points=None, boxes=None, masks=None)
+    sam_mask, score = sam.mask_decoder(
+        image_embeddings=image_embeddings,
+        image_pe=sam.prompt_encoder.get_dense_pe(),
+        sparse_prompt_embeddings=sparse_embeddings,
+        dense_prompt_embeddings=dense_embeddings,
+        multimask_output=False,
+    )
+    sam_mask = (sam_mask - sam_mask.min()) / (sam_mask.max() - sam_mask.min())
+    return sam_mask, score
+
 
 def preprocess_logits(logits, size=256, th=0.01, is_resize=True):
     logits = F.sigmoid(logits)
@@ -22,96 +36,53 @@ def preprocess_logits(logits, size=256, th=0.01, is_resize=True):
     return logits
 
 
-def gen_step(optimizer, out_mask, logits, score, criterion):
-    loss = 0
-    dice_loss, _ = Dice_loss(logits, out_mask)
-    bce_loss = criterion(out_mask, logits)
-    loss = loss + 0.00*(1 - score) + dice_loss + bce_loss
+def loss_step(optimizer, J, pred, criterion):
+    dice_loss, _ = Dice_loss(pred, J)
+    bce_loss = criterion(pred, J)
+    loss = dice_loss + bce_loss
     loss.backward()
     optimizer.step()
-    return loss.item(), dice_loss.item(), bce_loss.item()
+    return loss.item()
 
 
-def train_single_image(imgs, gts, original_sz, img_sz, sam, optimizer, args, file, ix):
-    loss_list = []
-    image = imgs.to(sam.device)
-    batched_input = get_input_dict(image, original_sz, img_sz)
-    pbar = trange(int(args['epoches']))
-    criterion = torch.nn.BCELoss()
+@torch.no_grad()
+def get_inputs(imgs, gts, sam, original_sz, img_sz):
+    '''
+    TODO: 
+    1. batched J
+    2. predefined points
+    3. eval
+    '''
+    batched_input = get_input_dict(imgs.cuda(), original_sz, img_sz)
     gts_large = sam.postprocess_masks(gts.unsqueeze(dim=0),
                                         input_size=img_sz[0],
                                         original_size=original_sz.squeeze().long().tolist())
     gts_large[gts_large>0.5] = 1
     gts_large[gts_large<=0.5] = 0
-    with torch.no_grad():
-        zero_pred, p_i, n_i  = get_similarity_maps(sam.eval(), imgs, gts.unsqueeze(dim=0).cuda(), th=0.5, pos=args['pos'], neg=args['neg'])
-        points_pred = zero_sam_with_points(sam, batched_input, p_i, n_i)
-        masks_pred = zero_sam_with_masks(sam, zero_pred, batched_input)
-    zero_pred =  F.interpolate(zero_pred.unsqueeze(dim=0).unsqueeze(dim=0),
-                              (256, 256),
-                               mode='bilinear', align_corners=True).cuda()
-    zero_pred[zero_pred>0.5]=1
-    zero_pred[zero_pred<=0.5]=0
-    zero_pred_large = sam.postprocess_masks(zero_pred,
-                                            input_size=img_sz[0],
-                                            original_size=original_sz.squeeze().long().tolist())
-    zero_pred_large[zero_pred_large>0.5] = 1
-    zero_pred_large[zero_pred_large<=0.5] = 0
-    points_pred_large = sam.postprocess_masks(points_pred.unsqueeze(dim=0).unsqueeze(dim=0),
-                                            input_size=img_sz[0],
-                                            original_size=original_sz.squeeze().long().tolist())
-    points_pred_large[points_pred_large>0.5] = 1
-    points_pred_large[points_pred_large<=0.5] = 0
-    masks_pred_large = sam.postprocess_masks(masks_pred.unsqueeze(dim=0).unsqueeze(dim=0),
-                                            input_size=img_sz[0],
-                                            original_size=original_sz.squeeze().long().tolist())
-    masks_pred_large[masks_pred_large>0.5] = 1
-    masks_pred_large[masks_pred_large<=0.5] = 0
-    
-    best = 0.0
-    res2 = 0.0
-    best_mask = None
-    best_i = None
-    for i in pbar:
-        optimizer.zero_grad()
-        out, score = get_sam_model_output(sam.train(), batched_input, zero_pred, it=args['it'])
-        loss, _, _ = gen_step(optimizer, out, zero_pred.detach(), score, criterion)
-        with torch.no_grad():
-            pred = out
-            pred[pred>0.5] = 1
-            pred[pred<=0.5] = 0
-            pred = sam.postprocess_masks(pred,
-                                         input_size=img_sz[0],
-                                         original_size=original_sz.squeeze().long().tolist())
-            dice_gt, ji_gt = get_dice_ji(pred.cpu().numpy(), gts_large.cpu().numpy())
-            _, ji = get_dice_ji(pred.cpu().numpy(), zero_pred_large.cpu().numpy())
-        if ji >= best:
-            best = ji
-            res2 = (dice_gt, ji_gt)
-            best_mask = pred.clone()
-            best_i = i
+    J, _, _  = get_similarity_maps(sam.eval(), imgs, gts.unsqueeze(dim=0).cuda(), th=0.5, pos=args['pos'], neg=args['neg'])
+    J = F.interpolate(J[None, None], (256, 256), mode='bilinear', align_corners=True)
+    return batched_input, gts_large, J
+
+
+def step(ds, sam, optimizer):
+    loss_list = []
+    criterion = torch.nn.BCELoss()
+    pbar = tqdm(ds)
+    for ix, (imgs, gts, original_sz, img_sz) in enumerate(pbar):
+        batched_input, _, J = get_inputs(imgs, gts, sam, original_sz, img_sz)
+        pred, _ = get_sam_model_output(sam, batched_input)
+        loss = loss_step(optimizer, J, pred, criterion)
         loss_list.append(loss)
         pbar.set_description(
             '(train | {}) epoch {epoch} ::'
-            ' res {res:.4f}'.format(
+            'loss: {loss:.4f}'.format(
                 'Medical',
-                epoch=i,
-                res=res2[1]
+                epoch=ix,
+                loss=np.mean(loss_list),
             ))
-    if best_mask is None:
-        best_mask = pred
-        best_i = args['epoches']
-    res1 = get_dice_ji(zero_pred_large.cpu().numpy(), gts_large.cpu().numpy())
-    file.write(str(ix) + ',' + 
-               str(best_i) + ',' +
-               str(best)[:6] + ',' +
-               str(res1[1])[:6] + ',' +
-               str(res2[1])[:6] + '\n')
-    file.flush()
-    return res1, res2
 
 
-def zero_sam(args=None, sam_args=None):
+def training(args=None, sam_args=None):
     if torch.cuda.is_available():
         device = torch.device("cuda")
     else:
@@ -121,37 +92,29 @@ def zero_sam(args=None, sam_args=None):
         trainset, testset = get_monu_dataset(args, sam_trans=transform)
     elif args['task'] == 'glas':
         trainset, testset = get_glas_dataset(args, sam_trans=transform)
-    ds = torch.utils.data.DataLoader(testset, batch_size=1, shuffle=False, num_workers=int(args['nW_eval']), drop_last=False)
-    pbar = tqdm(ds)
-    file = open(os.path.join('vis', args['task'], args['vit'], 'results.csv'), 'w')
-    file.write('file,best_ix,iou_loss,iou_owl,iou_gt\n')
-    file.flush()
-    dice1_list, dice2_list, iou1_list, iou2_list = [], [], [], []
-    for ix, (imgs, gts, original_sz, img_sz) in enumerate(pbar):
-        sam = sam_model_registry[sam_args['model_type']](checkpoint=sam_args['sam_checkpoint'])
-        sam.to(device=device)
-        opt_model = sam.image_encoder #mask_decoder, prompt_encoder, image_encoder
-        for param in sam.parameters():
-            param.requires_grad = False
-        for param in opt_model.parameters():
-            param.requires_grad = True
-        optimizer = optim.Adam(opt_model.parameters(),
-                            lr=float(args['learning_rate']),
-                            weight_decay=float(args['WD']))
-        res1, res2 = train_single_image(imgs, gts, original_sz, img_sz, sam.train(), optimizer, args, file, ix)
-        dice1_list.append(res1[0])
-        dice2_list.append(res2[0])
-        iou1_list.append(res1[1])
-        iou2_list.append(res2[1])
-        pbar.set_description(
-            '(train | {}) epoch {epoch} ::'
-            'iou1: {iou1:.4f} :: iou2 {iou2:.4f}'.format(
-                'Medical',
-                epoch=ix,
-                iou1=np.mean(iou1_list),
-                iou2=np.mean(iou2_list)
-            ))
-    return np.mean(dice1_list), np.mean(iou1_list), np.mean(dice2_list), np.mean(iou2_list)
+    sam = sam_model_registry[sam_args['model_type']](checkpoint=sam_args['sam_checkpoint'])
+    sam.to(device=device)
+    opt_model = sam.mask_decoder #mask_decoder, prompt_encoder, image_encoder
+    for param in sam.parameters():
+        param.requires_grad = False
+    for param in opt_model.parameters():
+        param.requires_grad = True
+    optimizer = optim.Adam(opt_model.parameters(),
+                        lr=float(args['learning_rate']),
+                        weight_decay=float(args['WD']))
+    ds = torch.utils.data.DataLoader(trainset,
+                                     batch_size=args['Batch_size'],
+                                     shuffle=True,
+                                     num_workers=int(args['nW']),
+                                     drop_last=True)
+    ds_test = torch.utils.data.DataLoader(testset,
+                                          batch_size=1,
+                                          shuffle=False,
+                                          num_workers=int(args['nW_eval']),
+                                          drop_last=False)
+    for ep in range(args['epoches']):
+        step(ds, sam.train(), optimizer)
+        
     
 
 if __name__ == '__main__':
@@ -159,16 +122,16 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Description of your program')
     parser.add_argument('-lr', '--learning_rate', default=1e-5, help='learning_rate', required=False)
     parser.add_argument('-bs', '--Batch_size', default=1, help='batch_size', required=False)
-    parser.add_argument('-epoches', '--epoches', default=2, help='number of epoches', required=False)
+    parser.add_argument('-epoches', '--epoches', default=70, help='number of epoches', required=False)
     parser.add_argument('-nW', '--nW', default=0, help='evaluation iteration', required=False)
     parser.add_argument('-nW_eval', '--nW_eval', default=0, help='evaluation iteration', required=False)
     parser.add_argument('-WD', '--WD', default=0, help='evaluation iteration', required=False)
     parser.add_argument('-task', '--task', default='glas', help='evaluation iteration', required=False)
+    parser.add_argument('-datadir', '--datadir', default='data/Warwick/', help='evaluation iteration', required=False)
     parser.add_argument('-rotate', '--rotate', default=22, help='image size', required=False)
     parser.add_argument('-scale1', '--scale1', default=0.75, help='image size', required=False)
     parser.add_argument('-scale2', '--scale2', default=1.25, help='image size', required=False)
     parser.add_argument('-Idim', '--Idim', default=512, help='image size', required=False)
-    parser.add_argument('-it', '--it', default=1, help='image size', required=False)
     parser.add_argument('-vit', '--vit', default='vit_b', help='image size', required=False)
     parser.add_argument('-pos', '--pos', default=1, help='image size', required=False)
     parser.add_argument('-neg', '--neg', default=1, help='image size', required=False)
@@ -190,21 +153,8 @@ if __name__ == '__main__':
         },
         'gpu_id': 0,
     }
-    name = args['task'] + '_' + args['vit'] + '_' +str(args['epoches']) 
-    f = open('results_' + name + '.csv', 'w')
-    f.write('dataset,vit,pos,neg,dice1,iou1,dice2,iou2\n')
-    f.flush()
     for points in [(1,1), (2,2), (3,3), (4,4), (5,5), (1,0), (2,0), (3,0), (4,0), (5,0)]:
         args['pos'] = points[0]
         args['neg'] = points[1]
-        dice1,iou1,dice2,iou2 = zero_sam(args=args, sam_args=sam_args)
-        f.write(args['task'] + ',' +
-                args['vit'] + ',' +
-                str(args['pos']) + ',' +
-                str(args['neg']) + ',' +
-                str(dice1) + ',' + 
-                str(iou1) + ',' +
-                str(dice2) + ',' + 
-                str(iou2) + '\n'
-                )
-        f.flush()
+        training(args=args, sam_args=sam_args)
+            
