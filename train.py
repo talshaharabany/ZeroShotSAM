@@ -49,19 +49,28 @@ def loss_step(optimizer, J, pred, criterion):
 def get_inputs(imgs, gts, sam, original_sz, img_sz):
     '''
     TODO: 
-    1. batched J
+    1. self/cross options
     2. predefined points
-    3. eval
+    3. binarization of output in the eval
     '''
+    bs = imgs.shape[0]
     batched_input = get_input_dict(imgs.cuda(), original_sz, img_sz)
-    gts_large = sam.postprocess_masks(gts.unsqueeze(dim=0),
-                                        input_size=img_sz[0],
-                                        original_size=original_sz.squeeze().long().tolist())
-    gts_large[gts_large>0.5] = 1
-    gts_large[gts_large<=0.5] = 0
-    J, _, _  = get_similarity_maps(sam.eval(), imgs, gts.unsqueeze(dim=0).cuda(), th=0.5, pos=args['pos'], neg=args['neg'])
-    J = F.interpolate(J[None, None], (256, 256), mode='bilinear', align_corners=True)
-    return batched_input, gts_large, J
+    gts = F.interpolate(gts.cuda().unsqueeze(dim=1), (256, 256), mode='nearest')
+    # gts_large = sam.postprocess_masks(gts.unsqueeze(dim=1),
+    #                                     input_size=img_sz[0],
+    #                                     original_size=original_sz[0].squeeze().long().tolist())
+    gts[gts>0.5] = 1
+    gts[gts<=0.5] = 0
+    J = torch.zeros(bs, 1, 256, 256).cuda()
+    for inx in range(bs):
+        curr_j, _, _  = get_similarity_maps(sam.eval(),
+                                            imgs[inx:inx+1],
+                                            gts[inx:inx+1],
+                                            th=0.5,
+                                            pos=args['pos'],
+                                            neg=args['neg'])
+        J[inx] = F.interpolate(curr_j[None, None], (256, 256), mode='bilinear', align_corners=True)
+    return batched_input, gts, J
 
 
 def step(ds, sam, optimizer):
@@ -69,8 +78,8 @@ def step(ds, sam, optimizer):
     criterion = torch.nn.BCELoss()
     pbar = tqdm(ds)
     for ix, (imgs, gts, original_sz, img_sz) in enumerate(pbar):
-        batched_input, _, J = get_inputs(imgs, gts, sam, original_sz, img_sz)
-        pred, _ = get_sam_model_output(sam, batched_input)
+        batched_input, _, J = get_inputs(imgs, gts, sam.eval(), original_sz, img_sz)
+        pred, _ = get_sam_model_output(sam.train(), batched_input)
         loss = loss_step(optimizer, J, pred, criterion)
         loss_list.append(loss)
         pbar.set_description(
@@ -81,6 +90,30 @@ def step(ds, sam, optimizer):
                 loss=np.mean(loss_list),
             ))
 
+
+@torch.no_grad()
+def eval_ds(ds, sam, args):
+    loss_list, j_list, pred_list  = [], [], []
+    pbar = tqdm(ds)
+    for ix, (imgs, gts, original_sz, img_sz) in enumerate(pbar):
+        batched_input, gts, J = get_inputs(imgs, gts, sam.eval(), original_sz, img_sz)
+        pred, _ = get_sam_model_output(sam.train(), batched_input)
+        dice_loss = 1 - Dice_loss(pred, J)[0]
+        dice_j = 1 - Dice_loss(J, gts)[0]
+        dice_pred = 1 - Dice_loss(pred, gts)[0]
+        loss_list.append(dice_loss.item())
+        j_list.append(dice_j.item())
+        pred_list.append(dice_pred.item())
+        pbar.set_description(
+            '(train | {}) epoch {epoch} ::'
+            'loss: {loss:.4f}, dice j: {dice_j:.4f}, dice pred: {dice_pred:.4f}'.format(
+                args['task'],
+                epoch=ix,
+                loss=np.mean(loss_list),
+                dice_j=np.mean(j_list),
+                dice_pred=np.mean(pred_list),
+            ))
+        
 
 def training(args=None, sam_args=None):
     if torch.cuda.is_available():
@@ -112,20 +145,21 @@ def training(args=None, sam_args=None):
                                           shuffle=False,
                                           num_workers=int(args['nW_eval']),
                                           drop_last=False)
-    for ep in range(args['epoches']):
+    for _ in range(args['epoches']):
         step(ds, sam.train(), optimizer)
-        
-    
+        # eval_ds(ds, sam.eval(), args)
+        eval_ds(ds_test, sam.eval(), args)
+           
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Description of your program')
-    parser.add_argument('-lr', '--learning_rate', default=1e-5, help='learning_rate', required=False)
-    parser.add_argument('-bs', '--Batch_size', default=1, help='batch_size', required=False)
+    parser.add_argument('-lr', '--learning_rate', default=1e-4, help='learning_rate', required=False)
+    parser.add_argument('-bs', '--Batch_size', default=4, help='batch_size', required=False)
     parser.add_argument('-epoches', '--epoches', default=70, help='number of epoches', required=False)
-    parser.add_argument('-nW', '--nW', default=0, help='evaluation iteration', required=False)
-    parser.add_argument('-nW_eval', '--nW_eval', default=0, help='evaluation iteration', required=False)
-    parser.add_argument('-WD', '--WD', default=0, help='evaluation iteration', required=False)
+    parser.add_argument('-nW', '--nW', default=4, help='evaluation iteration', required=False)
+    parser.add_argument('-nW_eval', '--nW_eval', default=4, help='evaluation iteration', required=False)
+    parser.add_argument('-WD', '--WD', default=1e-5, help='evaluation iteration', required=False)
     parser.add_argument('-task', '--task', default='glas', help='evaluation iteration', required=False)
     parser.add_argument('-datadir', '--datadir', default='data/Warwick/', help='evaluation iteration', required=False)
     parser.add_argument('-rotate', '--rotate', default=22, help='image size', required=False)
@@ -133,8 +167,8 @@ if __name__ == '__main__':
     parser.add_argument('-scale2', '--scale2', default=1.25, help='image size', required=False)
     parser.add_argument('-Idim', '--Idim', default=512, help='image size', required=False)
     parser.add_argument('-vit', '--vit', default='vit_b', help='image size', required=False)
-    parser.add_argument('-pos', '--pos', default=1, help='image size', required=False)
-    parser.add_argument('-neg', '--neg', default=1, help='image size', required=False)
+    parser.add_argument('-pos', '--pos', default=5, help='image size', required=False)
+    parser.add_argument('-neg', '--neg', default=5, help='image size', required=False)
     args = vars(parser.parse_args())
     os.makedirs('vis', exist_ok=True)
     os.makedirs(os.path.join('vis', args['task'], args['vit']), exist_ok=True)
@@ -153,8 +187,5 @@ if __name__ == '__main__':
         },
         'gpu_id': 0,
     }
-    for points in [(1,1), (2,2), (3,3), (4,4), (5,5), (1,0), (2,0), (3,0), (4,0), (5,0)]:
-        args['pos'] = points[0]
-        args['neg'] = points[1]
-        training(args=args, sam_args=sam_args)
+    training(args=args, sam_args=sam_args)
             
