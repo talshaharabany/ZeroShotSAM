@@ -39,7 +39,7 @@ def preprocess_logits(logits, size=256, th=0.01, is_resize=True):
 def loss_step(optimizer, J, pred, criterion):
     dice_loss, _ = Dice_loss(pred, J)
     bce_loss = criterion(pred, J)
-    loss = dice_loss + bce_loss
+    loss = args['w0']*dice_loss + bce_loss
     loss.backward()
     optimizer.step()
     return loss.item()
@@ -51,7 +51,6 @@ def get_inputs(imgs, gts, sam, original_sz, img_sz):
     TODO: 
     1. self/cross options
     2. predefined points
-    3. binarization of output in the eval
     '''
     bs = imgs.shape[0]
     batched_input = get_input_dict(imgs.cuda(), original_sz, img_sz)
@@ -98,6 +97,7 @@ def eval_ds(ds, sam, args):
     for ix, (imgs, gts, original_sz, img_sz) in enumerate(pbar):
         batched_input, gts, J = get_inputs(imgs, gts, sam.eval(), original_sz, img_sz)
         pred, _ = get_sam_model_output(sam.train(), batched_input)
+        pred = (pred >= 0.5).float()
         dice_loss = 1 - Dice_loss(pred, J)[0]
         dice_j = 1 - Dice_loss(J, gts)[0]
         dice_pred = 1 - Dice_loss(pred, gts)[0]
@@ -154,11 +154,11 @@ def training(args=None, sam_args=None):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Description of your program')
-    parser.add_argument('-lr', '--learning_rate', default=1e-4, help='learning_rate', required=False)
-    parser.add_argument('-bs', '--Batch_size', default=4, help='batch_size', required=False)
+    parser.add_argument('-lr', '--learning_rate', default=1e-5, help='learning_rate', required=False)
+    parser.add_argument('-bs', '--Batch_size', type=int, default=4, help='batch_size', required=False)
     parser.add_argument('-epoches', '--epoches', default=70, help='number of epoches', required=False)
-    parser.add_argument('-nW', '--nW', default=4, help='evaluation iteration', required=False)
-    parser.add_argument('-nW_eval', '--nW_eval', default=4, help='evaluation iteration', required=False)
+    parser.add_argument('-nW', '--nW', default=0, help='evaluation iteration', required=False)
+    parser.add_argument('-nW_eval', '--nW_eval', default=0, help='evaluation iteration', required=False)
     parser.add_argument('-WD', '--WD', default=1e-5, help='evaluation iteration', required=False)
     parser.add_argument('-task', '--task', default='glas', help='evaluation iteration', required=False)
     parser.add_argument('-datadir', '--datadir', default='data/Warwick/', help='evaluation iteration', required=False)
@@ -167,8 +167,9 @@ if __name__ == '__main__':
     parser.add_argument('-scale2', '--scale2', default=1.25, help='image size', required=False)
     parser.add_argument('-Idim', '--Idim', default=512, help='image size', required=False)
     parser.add_argument('-vit', '--vit', default='vit_b', help='image size', required=False)
-    parser.add_argument('-pos', '--pos', default=5, help='image size', required=False)
-    parser.add_argument('-neg', '--neg', default=5, help='image size', required=False)
+    parser.add_argument('-pos', '--pos', type=int, default=5, help='image size', required=False)
+    parser.add_argument('-neg', '--neg', type=int, default=5, help='image size', required=False)
+    parser.add_argument('-w0', '--w0', type=float, default=1, help='image size', required=False)
     args = vars(parser.parse_args())
     os.makedirs('vis', exist_ok=True)
     os.makedirs(os.path.join('vis', args['task'], args['vit']), exist_ok=True)

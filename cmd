@@ -1,0 +1,1 @@
+python -W ignore train.py -bs 5 -nW 5 -nW_val 1 
